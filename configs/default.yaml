@@ -1,0 +1,11 @@
+dataset: sciplex3
+seed: 0
+min_genes: 200
+max_pct_mito: 50.0
+min_cells_per_condition: 30
+n_hvg: 2000
+gene_set: hvg
+n_ceiling_reps: 10
+cache_dir: cache
+out_dir: outputs
+de_alpha: 0.05
