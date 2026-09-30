@@ -133,3 +133,36 @@ deliberately-adversarial (non-identity) gene union.
 - `time` (24h vs. 72h) is present in sciplex3's obs but not folded into `cond_id`;
   a small 72h subset is pooled with 24h cells of the same (cell_line, compound,
   dose) where both exist. Flagged in `DATA_RECON.md`, not addressed here.
+
+## Paired inference (current statistical policy)
+
+The runner now also writes `condition_scores.csv` and `comparisons.csv`.
+The primary comparison is **ridge minus per_drug_mean_delta raw delta Pearson
+correlation on held_out_context**, averaging contexts equally. Shared partition
+scores are averaged within each condition, then whole drugs are bootstrapped
+jointly across doses, times and cell lines (2,000 draws, deterministic seed).
+The report shows the paired difference, 95% interval, and unique condition/drug
+counts. Other metrics and individual cell lines are exploratory. Crossing zero
+means inconclusive; no secondary metric is used to declare overall success.
+
+These intervals describe the fixed fitted models on the observed contexts, not
+arbitrary unseen cell types. Related drugs may remain dependent; discrimination
+uses the fixed candidate pool. See CONTRACT ADDENDUM 4 for weighting, missing
+pairs, sparse clusters and interpretation limits.
+
+`results.csv` remains descriptive. Its legacy `n_conditions` includes repeated
+score evaluations; its marginal CI columns are suppressed. The new comparison
+counts distinguish conditions, drugs and partition pairs. Old checked-in outputs
+predate this policy and must not be used for the new inference.
+
+A fresh scoring run (using an existing compatible pseudobulk cache) is required:
+
+```bash
+.venv/bin/python -m perturb_bench.run --config configs/default.yaml --out-dir outputs_paired
+# If interrupted, use the same config and output directory:
+.venv/bin/python -m perturb_bench.run --config configs/default.yaml --out-dir outputs_paired --resume
+```
+
+Each completed fold saves summary and detailed scores together in an atomic
+checkpoint. Resume refuses incompatible configurations or legacy runs lacking
+those checkpoints. Reports and comparison CSVs are regenerated at completion.

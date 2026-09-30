@@ -12,8 +12,8 @@ Determinism: everything downstream of `load_pseudobulk` is a deterministic
 function of (data, cfg.seed) -- `make_folds` is seeded, baselines are fit
 only on deterministic inputs (Ridge's internal KFold CV is seeded with a
 fixed random_state=0, not cfg.seed, but that is a constant, not a source of
-run-to-run variance), the bootstrap CIs below are seeded off a stable hash of
-(cfg.seed, split, fold, baseline, metric, representation, target) rather than
+run-to-run variance), paired bootstrap CIs are seeded off a stable hash of
+(cfg.seed, comparison scope, metric) rather than
 global RNG state, and the final DataFrame is sorted on stable keys before
 being written. Two runs with the same config+seed must produce byte-identical
 results.csv.
@@ -55,12 +55,13 @@ import platform
 import subprocess
 import sys
 import time
-import zlib
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from . import checkpoints
+from .comparisons import condition_score_rows, build_comparisons, SCORE_COLUMNS
 from .config import Config
 from .data import load_pseudobulk, select_hvgs
 from .splits import REGIMES, assert_no_leakage, make_folds
@@ -68,7 +69,6 @@ from .baselines import BASELINES
 from .metrics import (
     METRIC_DIRECTION,
     aggregate,
-    bootstrap_ci_mean,
     normalize_score,
     score_conditions,
 )
@@ -112,7 +112,6 @@ _DRUG_AGNOSTIC_BASELINES = [
 
 _QUICK_MAX_FOLDS_PER_REGIME = 2
 _QUICK_MAX_GENES = 200
-_N_BOOT = 1000
 
 RESULTS_COLUMNS = [
     "split", "fold", "baseline", "metric", "representation", "target",
@@ -237,16 +236,6 @@ def _replicate_half1_for_fold(data, test_idx: np.ndarray, genes: np.ndarray) -> 
     pos = _halves_gene_positions(data, genes)
     idx = np.asarray(genes) if pos is None else pos
     return half1_test[:, :, idx]
-
-
-def _derived_seed(cfg_seed: int, *parts: str) -> int:
-    """Deterministic, reproducible per-row seed for bootstrap resampling.
-    Depends only on cfg.seed and a stable tuple of string keys (never on
-    iteration order or global RNG state), so re-running with the same config
-    and seed reproduces byte-identical ci_low/ci_high columns (determinism
-    requirement, module docstring)."""
-    h = zlib.crc32("|".join(parts).encode("utf-8"))
-    return int((int(cfg_seed) * 2_147_483_647 + h) % (2**31 - 1))
 
 
 def _normalize_with_guard(
@@ -417,19 +406,6 @@ def _write_run_meta(path: Path, cfg: Config, quick: bool, resume: bool, extra: d
         json.dump(meta, f, indent=2, default=str)
 
 
-def _existing_completed_folds(out_csv: Path) -> tuple[pd.DataFrame | None, set[tuple[str, str]]]:
-    """For --resume: read an existing results.csv (if any) and return
-    (existing_df, {(split, fold) pairs already present}). A (split, fold) pair
-    appearing at all means that fold's full row-set was appended atomically
-    (run() only appends once a fold's rows are fully computed in memory), so
-    presence is a safe completeness signal."""
-    if not out_csv.exists():
-        return None, set()
-    existing = pd.read_csv(out_csv)
-    done = set(existing[["split", "fold"]].drop_duplicates().itertuples(index=False, name=None))
-    return existing, done
-
-
 def run(
     cfg: Config, quick: bool = False, out_dir: str | None = None, resume: bool = False
 ) -> tuple[pd.DataFrame, dict]:
@@ -439,16 +415,14 @@ def run(
     out_csv = out_dir_path / "results.csv"
     meta_path = out_dir_path / "run_meta.json"
 
-    # H-6: run_meta.json is written BEFORE the sweep starts (config, seed,
-    # versions, git state), so a crash mid-sweep still leaves provenance on
-    # disk for whatever partial results.csv exists.
+    checkpoint_dir, completed = checkpoints.prepare(out_dir_path, cfg.to_dict(), quick, resume)
+    done_folds = {(r["split"], r["fold"]) for r in completed}
+    existing_rows = [row for record in completed for row in record["results"]]
+    score_rows = [row for record in completed for row in record["scores"]]
+    # Reconstruct the incremental summary from complete atomic fold records.
+    # A failed append never marks an incomplete fold as complete.
+    pd.DataFrame(existing_rows, columns=RESULTS_COLUMNS).to_csv(out_csv, index=False)
     _write_run_meta(meta_path, cfg, quick, resume)
-
-    existing_df, done_folds = (None, set())
-    if resume:
-        existing_df, done_folds = _existing_completed_folds(out_csv)
-        if done_folds:
-            _log(f"--resume: {len(done_folds)} fold(s) already present in {out_csv}, will skip them")
 
     _log(f"loading pseudobulk: dataset={cfg.dataset} cache_key={cfg.cache_key()} quick={quick}")
     data = load_pseudobulk(cfg)
@@ -459,15 +433,13 @@ def run(
     )
     n_rep = int(data.halves.shape[0])
 
-    all_rows: list[dict] = list(existing_df.to_dict("records")) if existing_df is not None else []
+    all_rows: list[dict] = list(existing_rows)
     n_folds_total = len(done_folds)
     n_leakage_checks = len(done_folds)
 
-    # H-6: incremental write -- append each fold's rows to results.csv as soon
-    # as they are computed (header once), so a crash at fold K does not lose
-    # folds 1..K-1. We open in append mode and write the header only if the
-    # file doesn't already exist (fresh run) or is empty.
-    header_needed = not (out_csv.exists() and out_csv.stat().st_size > 0)
+    # The summary header was written above. Atomic checkpoints, not append
+    # completeness, determine which folds are safe to resume.
+    header_needed = False
 
     for regime in REGIMES:
         folds = make_folds(data.obs, regime, cfg.seed)
@@ -529,6 +501,12 @@ def run(
                         fold_raw[(bname, rep, target)] = raw_df
                         fold_aggs[(bname, rep, target)] = aggregate(raw_df)
 
+            detailed_scores = pd.concat([
+                condition_score_rows(fold_raw[(name, "delta", PRIMARY_TARGET)],
+                                     data.obs.iloc[fold.test_idx], regime, fold.name, name)
+                for name in baseline_names
+            ], ignore_index=True)
+
             # Ceiling: score half0 vs half1 directly (rather than calling
             # `_ceiling_for_fold`/`compute_ceiling`, which would do this exact
             # per-rep loop internally a SECOND time) so the raw per-rep rows
@@ -564,11 +542,9 @@ def run(
                             normalized, normalized_std, valid = _normalize_with_guard(
                                 value, std, floor_mean, ceiling_mean, metric, fold.name, rep, target,
                             )
-                            seed = _derived_seed(cfg.seed, regime, fold.name, bname, metric, rep, target)
-                            ci_low, ci_high = bootstrap_ci_mean(
-                                fold_raw[(bname, rep, target)][metric].to_numpy(dtype=float),
-                                seed=seed, n_boot=_N_BOOT,
-                            )
+                            # Marginal row-wise CIs are not valid for repeated partitions.
+                            # Inference is exclusively in paired drug-cluster comparisons.csv.
+                            ci_low, ci_high = float("nan"), float("nan")
                             fold_rows.append(dict(
                                 split=regime, fold=fold.name, baseline=bname, metric=metric,
                                 representation=rep, target=target, value=value, std=std,
@@ -588,10 +564,7 @@ def run(
                         c_normalized, c_normalized_std, c_valid = _normalize_with_guard(
                             c_value, c_std, floor_mean, ceiling_mean, metric, fold.name, rep, target,
                         )
-                        seed = _derived_seed(cfg.seed, regime, fold.name, "ceiling", metric, rep, target)
-                        c_ci_low, c_ci_high = bootstrap_ci_mean(
-                            ceiling_raw[rep][metric].to_numpy(dtype=float), seed=seed, n_boot=_N_BOOT,
-                        )
+                        c_ci_low, c_ci_high = float("nan"), float("nan")
                         fold_rows.append(dict(
                             split=regime, fold=fold.name, baseline="ceiling", metric=metric,
                             representation=rep, target=target, value=c_value, std=c_std,
@@ -603,9 +576,11 @@ def run(
                             fallback_rate=float("nan"), fallback_rate_dose_collapsed=float("nan"),
                         ))
 
-            # Append this fold's rows to disk NOW (H-6) -- atomic from the
-            # --resume perspective: either all of a fold's rows are on disk,
-            # or none are.
+            # Commit summary and detailed scores together before appending the
+            # convenience CSV. Only the atomic checkpoint marks a fold complete.
+            detailed_records = detailed_scores.to_dict("records")
+            checkpoints.save(checkpoint_dir, regime, fold.name, fold_rows, detailed_records)
+            score_rows.extend(detailed_records)
             fold_df = pd.DataFrame(fold_rows, columns=RESULTS_COLUMNS)
             fold_df.to_csv(out_csv, mode="a", header=header_needed, index=False)
             header_needed = False
@@ -651,12 +626,23 @@ def run(
         "floor_policy": FLOOR_BASELINE,
         "targets": list(TARGETS),
         "primary_target": PRIMARY_TARGET,
+        "inference": {"method": "paired_drug_cluster_percentile_bootstrap", "n_boot": 2000,
+                      "primary_endpoint": "held_out_context/equal_context_mean/pearson_r",
+                      "weighting": "equal conditions within context, equal contexts",
+                      "scope": "fixed models, observed contexts and discrimination candidate pool",
+                      "summary_ci_policy": "suppressed; use comparisons.csv"},
     }
     with open(meta_path, "w") as f:
         json.dump(run_meta, f, indent=2, default=str)
 
+    condition_scores = pd.DataFrame(score_rows, columns=SCORE_COLUMNS).sort_values(
+        ["split", "fold", "baseline", "cond_id", "partition"]
+    ).reset_index(drop=True)
+    condition_scores.to_csv(out_dir_path / "condition_scores.csv", index=False)
+    comparisons = build_comparisons(condition_scores, seed=cfg.seed)
+    comparisons.to_csv(out_dir_path / "comparisons.csv", index=False)
     report_path = out_dir_path / "report.md"
-    report_mod.write_report(results, run_meta, report_path)
+    report_mod.write_report(results, run_meta, report_path, comparisons=comparisons)
     _log(f"wrote {report_path}")
 
     return results, run_meta

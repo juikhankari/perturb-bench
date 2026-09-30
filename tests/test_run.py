@@ -618,3 +618,51 @@ def test_run_meta_written_before_sweep_and_contains_provenance(tmp_path, synthet
     assert "versions" in seen_meta_early
     assert "git" in seen_meta_early
     assert seen_meta_early.get("seed") == cfg.seed
+
+
+def test_paired_artifacts_and_atomic_resume(tmp_path, synthetic, monkeypatch):
+    data, cfg = synthetic
+    _patch_loader(monkeypatch, data)
+    output = tmp_path / "paired"
+    # Simulate failure after the first fold is committed, before CSV append.
+    real_save = run_mod.checkpoints.save
+    def save_then_crash(*args, **kwargs):
+        real_save(*args, **kwargs)
+        raise RuntimeError("simulated interruption")
+    monkeypatch.setattr(run_mod.checkpoints, "save", save_then_crash)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_mod.run(cfg, quick=True, out_dir=str(output))
+    monkeypatch.setattr(run_mod.checkpoints, "save", real_save)
+    run_mod.run(cfg, quick=True, out_dir=str(output), resume=True)
+    before = {name: (output / name).read_bytes() for name in
+              ["results.csv", "condition_scores.csv", "comparisons.csv"]}
+    run_mod.run(cfg, quick=True, out_dir=str(output))
+    assert before == {name: (output / name).read_bytes() for name in before}
+    detailed = pd.read_csv(output / "condition_scores.csv")
+    comparison = pd.read_csv(output / "comparisons.csv")
+    main = comparison[comparison.endpoint == "primary"].iloc[0]
+    expected = detailed[(detailed.split == "held_out_context") & (detailed.baseline == "ridge")]
+    assert main.n_conditions == expected.cond_id.nunique()
+    assert main.n_usable_partition_pairs == len(expected)
+    assert main.n_drugs == expected.compound.nunique()
+    text = (output / "report.md").read_text()
+    assert "paired drug-cluster" in text
+    assert "no significant difference" not in text
+    assert "CIs do not overlap" not in text
+    assert "No paired inference" in text
+    assert "best normalized score on random =" in text
+
+
+def test_resume_rejects_legacy_and_changed_configuration(tmp_path, synthetic, monkeypatch):
+    data, cfg = synthetic
+    _patch_loader(monkeypatch, data)
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / "results.csv").write_text("split,fold\nrandom,test\n")
+    with pytest.raises(ValueError, match="Legacy results"):
+        run_mod.run(cfg, out_dir=str(legacy), resume=True)
+    modern = tmp_path / "modern"
+    modern.mkdir()
+    run_mod.checkpoints.prepare(modern, cfg.to_dict(), True, False)
+    with pytest.raises(ValueError, match="mismatch"):
+        run_mod.run(cfg, quick=False, out_dir=str(modern), resume=True)

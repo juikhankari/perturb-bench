@@ -218,3 +218,58 @@ Updated floor table:
 | mae | no_change | genuine "predict nothing" floor |
 | direction_acc_de | global_mean_delta | no_change's 0.0 is a sign(0) artifact, not a floor |
 | pert_discrimination | no_change | 0.5 is genuine chance |
+
+## ADDENDUM 4 — paired drug-cluster inference
+
+Supersedes any rule declaring a winner from non-overlapping marginal intervals,
+row-wise bootstrapping of partition scores, or pooled normal intervals.
+
+The primary endpoint is **ridge minus per_drug_mean_delta raw delta Pearson r**
+on `held_out_context`, with `replicate_half` targets. This endpoint was chosen
+after inspecting existing results; it is not a preregistered confirmatory test.
+All other metrics and individual-context comparisons are exploratory. No claim
+of overall success may be selected from whichever secondary metric happens to win.
+
+Pair predictions on identical condition and partition identifiers. Drop a
+partition pair if either score is nonfinite, then average the shared finite
+partition scores within each condition. Report excluded conditions and partition
+pairs. Within each context, weight usable conditions equally; in the pooled
+statistic weight observed contexts equally. Missing all usable pairs in a context
+makes the pooled result unavailable, rather than changing its context population.
+
+Draw 2,000 bootstrap samples of **whole drugs**, using the same sampled drug
+multiplicities across every context, dose and time. Recompute the paired mean
+difference for each draw. Use the 2.5th and 97.5th percentiles for the 95% interval.
+Drug clusters retain their condition counts; this is condition weighting within
+context, not equal-drug weighting. Suppress inference if any context has fewer
+than two usable drugs. Resamples missing a context are excluded and counted;
+if fewer than 95% cover every context, suppress the interval. Sparse-cluster
+intervals near this threshold should still be interpreted cautiously.
+
+An interval entirely above/below zero supports the corresponding direction,
+accounting for lower-is-better metrics. Crossing zero means inconclusive, not
+equivalent. Intervals are conditional on fitted models, observed cell lines and
+(for discrimination) the fixed candidate pool. They do not capture training-set
+variation, unseen-context uncertainty, pathway-level dependence across drugs, or
+normalization-denominator uncertainty. Scores are not recomputed against a
+resampled discrimination candidate pool. No normalized inferential interval is
+claimed. Practical significance requires judging effect magnitude separately.
+
+New artifacts:
+- `condition_scores.csv`: primary delta scores, one row per
+  `(split, fold, baseline, cond_id, partition)`, with compound, dose, time,
+  cell_line and all five metric columns. Repetitions are preserved for auditing,
+  but are never treated as independent condition observations for inference.
+- `comparisons.csv`: per-context and equal-context mean comparisons, raw paired
+  means/difference, interval, endpoint designation, unique condition/drug/context
+  counts, usable/excluded partition-pair counts, bootstrap coverage and status.
+- `fold_checkpoints/`: atomic per-fold summary plus detailed-score records and
+  a config/schema manifest. Resume reads only complete checkpoints, rejects
+  changed configurations, and cannot resume legacy aggregate-only runs.
+
+`results.csv` keeps its existing descriptive schema. Its `n_conditions` is a
+legacy score-evaluation count (including partitions), and std describes spread,
+not standard error. `ci_low`/`ci_high` are now NaN: inference lives exclusively
+in `comparisons.csv`. Q1 and other split regimes remain descriptive pending
+additional paired comparison designs. New runs must regenerate detailed scores;
+the historical committed outputs cannot reconstruct paired uncertainty.

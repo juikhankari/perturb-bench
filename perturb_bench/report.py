@@ -7,9 +7,8 @@ TONE (binding, not a style suggestion): this report exists to make it hard to fo
 ourselves. It states what the numbers say, including when no baseline beats
 no_change, or when ridge loses to per_drug_mean_delta. It does not editorialize
 results upward or bury a negative finding. SPEC §11 forbids a bare mean anywhere --
-every mean printed here carries its std and n, and winner/"beats" claims additionally
-require a bootstrap or normal-approximation confidence interval to not overlap before
-being declared (M-2) -- a point-estimate gap alone is not evidence.
+Summary means carry descriptive spread and score-evaluation counts. Inference uses
+paired drug-cluster intervals from comparisons.csv, never marginal CI overlap.
 
 ADDENDUM 3 (CONTRACT.md): results.csv now carries a `target` column.
 `"replicate_half"` is PRIMARY (baselines and the ceiling are scored against the SAME
@@ -108,28 +107,6 @@ def _pool(rows: pd.DataFrame) -> tuple[float, float, int]:
     mean = float((n * v).sum() / n_total)
     var = float((n * (s ** 2 + (v - mean) ** 2)).sum() / n_total)
     return mean, math.sqrt(max(var, 0.0)), int(n_total)
-
-
-def _normal_ci(mean: float, std: float, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Normal-approximation CI from a pooled mean/std/n (M-2: used for
-    multi-fold pooled winner/"beats" claims, where we only have the
-    already-aggregated mean/std/n, not the raw per-condition values needed
-    for an exact cross-fold bootstrap). For a SINGLE fold, results.csv's own
-    `ci_low`/`ci_high` columns (an exact percentile bootstrap over that
-    fold's conditions, computed in run.py) are preferred where available --
-    see `_single_fold_ci`."""
-    if math.isnan(mean) or math.isnan(std) or n <= 0:
-        return float("nan"), float("nan")
-    se = std / math.sqrt(n)
-    return mean - z * se, mean + z * se
-
-
-def _ci_excludes(lo: float, hi: float, other_lo: float, other_hi: float) -> bool:
-    """True iff the two intervals do not overlap at all (strict separation) --
-    used as the bar for declaring a winner, not a bare point-estimate gap."""
-    if any(math.isnan(x) for x in (lo, hi, other_lo, other_hi)):
-        return False
-    return hi < other_lo or lo > other_hi
 
 
 def _pool_normalized(rows: pd.DataFrame) -> tuple[float, float, int]:
@@ -432,89 +409,42 @@ def _absolute_vs_delta_section(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def _b3_vs_b4_section(df: pd.DataFrame) -> str:
-    sub = df[(df["split"] == "held_out_context") & (df["representation"] == "delta") & (df["target"] == PRIMARY_TARGET)]
-    lines = [
-        "## B3 (per_drug_mean_delta) vs B4 (ridge) on held_out_context\n",
-        "This is the comparison SPEC §10 Q3 hinges on. B3 knows the drug and ignores "
-        "context entirely (same predicted delta for a drug regardless of cell line). B4 "
-        "(ridge) is the first baseline that can actually use the held-out cell line's own "
-        "control expression as an input. If ridge does not beat per_drug_mean_delta here, "
-        "context does not modulate the transcriptional response in a way this baseline "
-        "suite can learn linearly from control expression alone. A \"winner\" is only "
-        "declared when the two baselines' 95% confidence intervals on the raw metric do "
-        "NOT overlap (M-2) -- a point-estimate gap alone is never treated as evidence here. "
-        "For a single fold the interval is the exact bootstrap `ci_low`/`ci_high` written by "
-        "run.py; pooled across folds it is a normal approximation from the pooled mean/std/n "
-        "(see `_normal_ci` in report.py) since exact per-condition values aren't carried "
-        "through the pooling step.\n",
-    ]
-    if sub.empty or "ridge" not in sub["baseline"].unique():
-        lines.append("No held_out_context/ridge rows were produced in this run.\n")
-        return "\n".join(lines)
-
-    lines.append("| metric | per_drug_mean_delta (mean±std, n) | ridge (mean±std, n) | gap (ridge - B3) | 95% CIs overlap? | winner |")
-    lines.append("|---|---|---|---|---|---|")
-    any_ridge_win = False
-    any_b3_win = False
-    for metric in METRICS:
-        b3_rows = sub[(sub["baseline"] == "per_drug_mean_delta") & (sub["metric"] == metric)]
-        b4_rows = sub[(sub["baseline"] == "ridge") & (sub["metric"] == metric)]
-        if b3_rows.empty or b4_rows.empty:
-            continue
-        b3_mean, b3_std, b3_n = _pool(b3_rows)
-        b4_mean, b4_std, b4_n = _pool(b4_rows)
-        higher_better = metric in HIGHER_BETTER
-        b3_lo, b3_hi = _normal_ci(b3_mean, b3_std, b3_n)
-        b4_lo, b4_hi = _normal_ci(b4_mean, b4_std, b4_n)
-        overlap = not _ci_excludes(b3_lo, b3_hi, b4_lo, b4_hi)
-
-        if math.isnan(b3_mean) or math.isnan(b4_mean):
-            winner = "n/a (NaN)"
-        elif overlap:
-            winner = "no significant difference"
-        elif (b4_mean > b3_mean) == higher_better:
-            winner = "ridge"
-            any_ridge_win = True
-        else:
-            winner = "per_drug_mean_delta"
-            any_b3_win = True
-        gap = b4_mean - b3_mean if not (math.isnan(b3_mean) or math.isnan(b4_mean)) else float("nan")
-        lines.append(
-            f"| {metric} | {_fmt(b3_mean)}±{_fmt(b3_std)}, {b3_n} | "
-            f"{_fmt(b4_mean)}±{_fmt(b4_std)}, {b4_n} | {_fmt(gap)} | {'yes' if overlap else 'no'} | {winner} |"
-        )
-    lines.append("")
-    if any_ridge_win:
-        lines.append(
-            "ridge beats per_drug_mean_delta, with non-overlapping 95% CIs, on at least one "
-            "metric above -- some context-dependence is linearly recoverable from control "
-            "expression on this data, though see the per-metric breakdown for which ones.\n"
-        )
-    elif any_b3_win:
-        lines.append(
-            "**per_drug_mean_delta beats ridge, with non-overlapping 95% CIs, on at least one "
-            "metric above and ridge wins none.** Per SPEC §10: if the answer to Q3 is no, that "
-            "is a real finding to report plainly, not a result to work around. Knowing only "
-            "the drug's identity and ignoring the held-out cell line's control expression "
-            "entirely (B3) does BETTER than a linear model that is given that control "
-            "expression (B4). That does not prove context-dependence is unlearnable in "
-            "general -- it is evidence against it being *linearly* learnable from control "
-            "expression alone, on this dataset, with this feature set. The broader research "
-            "programme this harness was built to support should treat that as a real "
-            "negative result, not as motivation to quietly swap in a fancier featurization "
-            "until the number moves.\n"
-        )
-    else:
-        lines.append(
-            "**No metric above shows a statistically distinguishable winner between ridge "
-            "and per_drug_mean_delta** (every CI pair overlaps, or one side is undefined). "
-            "Per SPEC §10: context-dependence is not demonstrated to be linearly learnable "
-            "from control expression on this data with this feature set -- the data here "
-            "does not support a confident claim in either direction, which is itself "
-            "informative and should not be rounded up to \"ridge wins\" or \"B3 wins\" from "
-            "point estimates alone.\n"
-        )
+def _b3_vs_b4_section(df: pd.DataFrame, comparisons=None) -> str:
+    lines = ["## B3 vs B4: paired drug-cluster comparisons on held_out_context\n",
+             "Primary endpoint: raw delta Pearson correlation, replicate-half target, "
+             "ridge minus per_drug_mean_delta, averaged equally across the observed cell lines. "
+             "This endpoint was selected after inspecting previous results, not preregistered. "
+             "Conditions are weighted equally within each cell line. Shared finite partition "
+             "pairs are averaged within each condition before resampling whole drugs jointly "
+             "across cell lines, doses and times (2,000 draws; percentile 95% interval).\n",
+             "Intervals are conditional on these fitted models and observed cell lines, "
+             "not arbitrary unseen cell types or new training samples. Related drugs may remain "
+             "dependent across clusters. Discrimination holds the candidate pool fixed. "
+             "Secondary metrics and per-cell-line comparisons are exploratory, without "
+             "multiplicity adjustment; they cannot establish overall success. "
+             "An interval crossing zero is inconclusive, not evidence of equivalence. "
+             "Practical importance requires considering the magnitude separately.\n"]
+    if comparisons is None or comparisons.empty:
+        return "\n".join(lines + ["Paired scores unavailable: rerun scoring; no winner claim is supported.\n"])
+    primary = comparisons[comparisons.endpoint == "primary"].iloc[0]
+    lines.append(f"**Primary comparison:** difference = {_fmt(primary.difference)}, "
+                 f"95% CI [{_fmt(primary.ci_low)}, {_fmt(primary.ci_high)}]; "
+                 f"evidence: {primary.evidence} (status: {primary.status}).\n")
+    lines.append("Raw differences are A minus B (A=ridge, B=per_drug_mean_delta). "
+                 "Positive favors A for correlations/direction accuracy; negative favors A "
+                 "for MAE/discrimination. Evidence labels account for that direction.\n")
+    columns = ["scope", "metric", "endpoint", "mean_a", "mean_b", "difference", "ci_low", "ci_high",
+               "n_conditions", "n_excluded_conditions", "n_drugs", "n_contexts",
+               "n_usable_partition_pairs", "n_excluded_partition_pairs", "status", "evidence"]
+    show = comparisons[columns].copy()
+    for column in ["mean_a", "mean_b", "difference", "ci_low", "ci_high"]:
+        show[column] = show[column].map(_fmt)
+    lines.append(_df_to_markdown(show))
+    lines.append("Counts distinguish unique usable conditions and drugs from partition pairs. "
+                 "Excluded pairs are nonfinite or missing for either baseline; means use the "
+                 "same paired observations. Fewer than two usable drugs in a context suppresses "
+                 "inference. Bootstrap draws missing a context are excluded; if more than 5% "
+                 "are invalid, the interval is suppressed (coverage is recorded in comparisons.csv).\n")
     return "\n".join(lines)
 
 
@@ -679,54 +609,16 @@ def _spec10_answers_section(df: pd.DataFrame) -> str:
 
     # Q1: does any baseline beat no_change on delta metrics, relative to ceiling?
     lines.append("### Q1: Does any baseline beat no_change on delta metrics, and by how much relative to the noise ceiling?\n")
-    lines.append(
-        "\"Beats\" below requires the baseline's and no_change's 95% CIs on the raw metric "
-        "to NOT overlap (M-2) -- a better point estimate alone does not qualify.\n"
-    )
+    lines.append("Comparisons against no_change remain descriptive. No paired inference "
+                 "is implemented for Q1 in this iteration; separate marginal confidence "
+                 "intervals and pooled scores across regimes do not establish a winner.\n")
     delta = df[(df["representation"] == "delta") & (df["target"] == PRIMARY_TARGET)]
-    any_beats = []
-    for metric in METRICS:
-        higher_better = metric in HIGHER_BETTER
-        nc = delta[(delta["baseline"] == "no_change") & (delta["metric"] == metric)]
-        nc_mean, nc_std, nc_n = _pool(nc) if not nc.empty else (float("nan"), float("nan"), 0)
-        nc_lo, nc_hi = _normal_ci(nc_mean, nc_std, nc_n)
-        for b in delta["baseline"].unique():
-            if b in ("no_change", "ceiling"):
-                continue
-            rows = delta[(delta["baseline"] == b) & (delta["metric"] == metric)]
-            if rows.empty:
-                continue
-            mean, std, n = _pool(rows)
-            if math.isnan(mean) or math.isnan(nc_mean):
-                continue
-            b_lo, b_hi = _normal_ci(mean, std, n)
-            beats_point = (mean > nc_mean) if higher_better else (mean < nc_mean)
-            beats_ci = beats_point and _ci_excludes(b_lo, b_hi, nc_lo, nc_hi)
-            if beats_ci:
-                norm_mean, norm_std, nn = _pool_normalized(rows)
-                any_beats.append((b, metric, mean, nc_mean, norm_mean, norm_std))
-    if any_beats:
-        lines.append("At least one baseline beats no_change (non-overlapping 95% CI) on at least one delta metric:\n")
-        for b, metric, mean, nc_mean, norm_mean, norm_std in any_beats[:15]:
-            lines.append(
-                f"- {b} on {metric}: {_fmt(mean)} vs no_change {_fmt(nc_mean)} (CIs do not overlap); "
-                f"normalized (floor-to-ceiling) = {_fmt(norm_mean)} ± {_fmt(norm_std)}"
-            )
-        lines.append("")
-    else:
-        lines.append(
-            "**No baseline beats no_change, with a non-overlapping confidence interval, on "
-            "any delta metric in this run.** Where no_change itself is the floor (mae, "
-            "pert_discrimination), no other baseline scored better with statistical "
-            "separation; where a metric is undefined for no_change (pearson_r, pearson_r_de, "
-            "both NaN on delta) no comparison against it is even possible on those metrics, "
-            "let alone a win. Report this plainly rather than searching for a favorable cut "
-            "of the data.\n"
-        )
 
     # Q2: held_out_context vs random
     lines.append("### Q2: How much worse is held_out_context than random? (size of the generalization problem)\n")
     for metric in METRICS:
+        if metric == "mae":
+            continue  # normalized MAE is explicitly unsuitable for comparisons
         row_cells = []
         for split in ("random", "held_out_context"):
             sub = delta[(delta["split"] == split) & (delta["metric"] == metric) & (~delta["baseline"].isin(["ceiling"]))]
@@ -838,7 +730,7 @@ def _mae_normalization_instability_section(df: pd.DataFrame) -> str:
     return "".join(out)
 
 
-def build_report_text(df: pd.DataFrame, run_meta: dict) -> str:
+def build_report_text(df: pd.DataFrame, run_meta: dict, comparisons=None) -> str:
     cfg = run_meta.get("config", {})
     parts = [
         "# Perturbation-response benchmark harness -- report\n",
@@ -856,7 +748,10 @@ def build_report_text(df: pd.DataFrame, run_meta: dict) -> str:
         "what the numbers say, including negative results, per the tone requirement in this "
         "harness's task spec -- it does not editorialize results upward or bury a result that "
         "undercuts the motivating hypothesis. Every mean below carries a std and/or a "
-        "confidence interval; no winner or \"beats\" claim is made from a point estimate alone.\n",
+        "confidence interval. Legacy summary tables are descriptive: their n counts score "
+        "evaluations including repeated partitions, and their standard deviations describe "
+        "spread, not uncertainty in a mean. Marginal summary CIs are suppressed. Only the "
+        "paired comparison section supports inference.\n",
         "---\n",
         _direction_guard_section(df),
         "---\n",
@@ -870,7 +765,7 @@ def build_report_text(df: pd.DataFrame, run_meta: dict) -> str:
         "---\n",
         _mae_normalization_instability_section(df),
         "---\n",
-        _b3_vs_b4_section(df),
+        _b3_vs_b4_section(df, comparisons),
         "---\n",
         _fallback_and_data_section(df, run_meta),
         "---\n",
@@ -879,6 +774,6 @@ def build_report_text(df: pd.DataFrame, run_meta: dict) -> str:
     return "\n".join(parts)
 
 
-def write_report(df: pd.DataFrame, run_meta: dict, path: str | Path) -> None:
-    text = build_report_text(df, run_meta)
+def write_report(df: pd.DataFrame, run_meta: dict, path: str | Path, comparisons=None) -> None:
+    text = build_report_text(df, run_meta, comparisons)
     Path(path).write_text(text)
